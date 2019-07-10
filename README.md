@@ -1,9 +1,11 @@
 # particle_filtering_model_predictive_control  
-# to do
 Particle filtering model predictive control simulation.
 ~~~
 python particle_filtering_model_predictive_control.py
 ~~~
+## to do  
+ - fix state update  
+ - fix horizon control
 ## Result  
 ![demo](./pf-mpc.gif)  
 ## Reference  
