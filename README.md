@@ -5,7 +5,8 @@ python particle_filtering_model_predictive_control.py
 ~~~
 ## to do  
  - fix state update  
- - fix horizon control
+ - fix horizon control  
+ - delete index
 ## Result  
 ![demo](./pf-mpc.gif)  
 ## Reference  
