@@ -6,7 +6,9 @@ python particle_filtering_model_predictive_control.py
 ## to do  
  - fix state update  
  - fix horizon control  
- - delete index
+ - delete index  
+ - visualize predict trajectry  
+ 
 ## Result  
 ![demo](./pf-mpc.gif)  
 ## Reference  
