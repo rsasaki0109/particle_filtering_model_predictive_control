@@ -223,10 +223,10 @@ def main():
 
         time = time + dt
 
-        x.append(state.x)
-        y.append(state.y)
-        yaw.append(state.yaw)
-        v.append(state.v)
+        x.append(*state.x)
+        y.append(*state.y)
+        yaw.append(*state.yaw)
+        v.append(*state.v)
         t.append(time)
 
         if show_animation:  # pragma: no cover
