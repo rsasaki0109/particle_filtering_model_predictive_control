@@ -2,264 +2,217 @@ import numpy as np
 import math
 import matplotlib.pyplot as plt
 
-k = 0.1  # look forward gain
-Lfc = 2.0  # look-ahead distance
-Kp = 1.0  # speed proportional gain
-dt = 0.1  # [s]
-L = 2.9  # [m] wheel base of vehicle
+# ===== Params =====
+DT   = 0.1
+NP   = 400              # 粒子数を増やして安定化
+H    = 6                # 先読み長（追従重視）
+k    = 0.1
+Lfc  = 2.0
+TMAX = 50.0
 
-# Estimation parameter of PF-MPC
-Q = np.diag([0.1])**2  # range error
+# 速度目標（一定でOK。必要なら曲率依存にしても良い）
+V_REF = 5.0  # [m/s]
 
-#  Simulation parameter
-Qsim = np.diag([0.2])**2
-Rsim = np.diag([1.0, np.deg2rad(30.0)])**2
+# 乱数サンプリング幅（前回入力の周りにサンプル）
+SIG_A = 0.6               # m/s^2
+SIG_W = np.deg2rad(12.0)  # rad/s
 
-DT = 0.1  # time tick [s]
+# 入力・速度制限（暴走抑制）
+A_MIN, A_MAX = -2.5, 2.5
+W_MIN, W_MAX = -1.0, 1.0
+V_MIN, V_MAX = 0.0, 12.0
 
-# pf-mpc parameter
-H = 1  # horizon length
-NP = 200  # Number of Particle
-NTh = NP / 2.0  # Number of particle for re-sampling
+# コスト重み（横ずれ・向き・速度・入力変化）
+W_CTE   = 1.0
+W_YAW   = 0.35
+W_VEL   = 0.15
+W_DU    = 0.02
 
-old_nearest_point_index = None
-show_animation = True
+np.random.seed(0)  # 再現性
 
+# ===== Helpers =====
+def wrap_pi(a):
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 class State:
-
-    def __init__(self, x=0.0, y=0.0, yaw=0.0, v=0.0):
-        self.x = x
-        self.y = y
-        self.yaw = yaw
-        self.v = v
-
-
-def motion_model(x, u):
-
-    F = np.array([[1.0, 0, 0, 0],
-                  [0, 1.0, 0, 0],
-                  [0, 0, 1.0, 0],
-                  [0, 0, 0, 0]])
-
-    B = np.array([[DT * math.cos(x[2, 0]), 0],
-                  [DT * math.sin(x[2, 0]), 0],
-                  [0.0, DT],
-                  [1.0, 0.0]])
-
-    x = F.dot(x) + B.dot(u)
-
-    return x
-
-def gauss_likelihood(x, sigma):
-    p = 1.0 / (2.0 * np.pi * np.linalg.det(sigma))**0.5 * \
-        np.exp(-0.5 * x.T @ np.linalg.inv(sigma) @ x)
-
-    return p
-
-def resampling(px, pw):
-    """
-    low variance re-sampling
-    """
-
-    Neff = 1.0 / (pw.dot(pw.T))[0, 0]  # Effective particle number
-    if Neff < NTh:
-        wcum = np.cumsum(pw)
-        base = np.cumsum(pw * 0.0 + 1 / NP) - 1 / NP
-        resampleid = base + np.random.rand(base.shape[0]) / NP
-
-        inds = []
-        ind = 0
-        for ip in range(NP):
-            while resampleid[ip] > wcum[ind]:
-                ind += 1
-            inds.append(ind)
-
-        inds = np.array(inds, dtype=int)  # Add this line
-        px = px[:, inds]
-        pw = np.zeros((1, NP)) + 1.0 / NP  # init weight
-
-    return px, pw
+    def __init__(self, x=0.0, y=-3.0, yaw=0.0, v=0.0):
+        self.x=float(x); self.y=float(y); self.yaw=float(yaw); self.v=float(v)
 
 def target_trajectory(ix):
-    t = math.sin(ix / 5.0) * ix / 2.0
+    return math.sin(ix / 5.0) * ix / 2.0
 
-    return t
+def build_path(x_end=50.0, dx=0.1):
+    cx = np.arange(0.0, x_end, dx)
+    cy = np.array([target_trajectory(ix) for ix in cx])
+    return cx, cy
 
-def refrence_trajectory(state, x, ty):
-    Ts = 1
-    s = (ty - state.y) * (1 - math.exp(-(x - state.x) / Ts)) + state.y
+def nearest_on_path(x, y, cx, cy):
+    d = (cx-x)**2 + (cy-y)**2
+    i = int(np.argmin(d))
+    i2 = min(i+1, len(cx)-1)
+    dx = cx[i2]-cx[i]; dy = cy[i2]-cy[i]
+    path_yaw = math.atan2(dy, dx) if (dx!=0 or dy!=0) else 0.0
+    # 符号付き横ずれ：左正
+    sign = np.sign(dx*(y-cy[i]) - dy*(x-cx[i]))
+    e_y  = float(sign * math.hypot(x-cx[i], y-cy[i]))
+    return i, e_y, path_yaw
 
-    return s
+def calc_target_index(state, cx, cy, old_idx=None):
+    if old_idx is None:
+        d = [math.hypot(state.x - ix, state.y - iy) for ix, iy in zip(cx, cy)]
+        ind = int(np.argmin(d))
+    else:
+        ind = int(old_idx)
+        dst = math.hypot(state.x - cx[ind], state.y - cy[ind])
+        while True:
+            nxt = ind + 1 if (ind + 1) < len(cx) else ind
+            dst2 = math.hypot(state.x - cx[nxt], state.y - cy[nxt])
+            if dst < dst2 or nxt == ind: break
+            ind, dst = nxt, dst2
+    # 先行点
+    Lacc = 0.0; Lf = k * state.v + Lfc
+    while Lf > Lacc and (ind + 1) < len(cx):
+        Lacc = math.hypot(cx[ind]-state.x, cy[ind]-state.y)
+        ind += 1
+    return ind
 
-def pf_mpc(state, cx, cy, pind, px, pw, u):
-    pu = np.zeros((2, NP))  # Particle imput
+# ===== Models =====
+def motion_model(x, u):
+    """ x=[x,y,yaw,v]^T, u=[a,w]^T """
+    a=float(u[0,0]); w=float(u[1,0]); v=float(x[3,0])
+    nx = np.zeros_like(x)
+    nx[0,0] = float(x[0,0] + v * math.cos(x[2,0]) * DT)
+    nx[1,0] = float(x[1,0] + v * math.sin(x[2,0]) * DT)
+    nx[2,0] = wrap_pi(float(x[2,0] + w * DT))
+    nx[3,0] = float(np.clip(v + a * DT, V_MIN, V_MAX))
+    return nx
 
-    ind = calc_target_index(state, cx, cy)
+def low_variance_resampling(px, pw):
+    NP_local = px.shape[1]
+    Neff = 1.0 / (pw.dot(pw.T))[0,0]
+    if Neff < NP_local/2.0:
+        w = pw[0].copy(); w/=w.sum()
+        wc = np.cumsum(w)
+        r0 = np.random.rand() / NP_local
+        pos = r0 + (np.arange(NP_local) / NP_local)
+        inds = np.zeros(NP_local, dtype=int); i=j=0
+        while i<NP_local and j<NP_local:
+            if pos[i] < wc[j]: inds[i]=j; i+=1
+            else: j+=1
+        px = px[:, inds]
+        pw = np.zeros((1, NP_local)) + 1.0 / NP_local
+    return px, pw
 
-    if pind >= ind:
-        ind = pind
-
-    if not (ind < len(cx)):
-        ind = len(cx) - 1
+# ===== PF-MPC (追従コストで評価) =====
+def pf_mpc_step(state, cx, cy, px, pw, u_prev):
+    """
+    粒子ごとに H ステップの将来をサンプルし、累積コストで重み付け。
+    最重粒子の「最初の入力」を次入力に採択。
+    """
+    pu = np.zeros((2, NP))
+    costs = np.zeros(NP)
 
     for ip in range(NP):
         xp = np.array([px[:, ip]]).T
-        w = pw[0, ip]
+        u_last = u_prev.copy()
+        J = 0.0
+
         for i in range(H):
-            #  Predict with random input sampling
-            ud1 = u[0] + np.random.randn() * Rsim[0, 0] * 4
-            ud2 = u[1] + np.random.randn() * Rsim[1, 1] * 4
-            ud = np.array([[ud1, ud2]]).T
-            xp = motion_model(xp, ud)
+            # 前回入力の周りでサンプル
+            a = float(u_last[0] + np.random.randn()*SIG_A)
+            w = float(u_last[1] + np.random.randn()*SIG_W)
+            a = float(np.clip(a, A_MIN, A_MAX))
+            w = float(np.clip(w, W_MIN, W_MAX))
+            u = np.array([[a, w]]).T
+
+            xp = motion_model(xp, u)
+
+            # 誤差（横ずれ・向き・速度）
+            _, e_y, path_yaw = nearest_on_path(float(xp[0,0]), float(xp[1,0]), cx, cy)
+            e_yaw = wrap_pi(float(xp[2,0]) - path_yaw)
+            e_v   = float(xp[3,0]) - V_REF
+
+            # 入力正則化（前ステップからの変化も罰則）
+            du_a = float(u[0,0] - u_last[0,0])
+            du_w = float(u[1,0] - u_last[1,0])
+
+            J += W_CTE*(e_y**2) + W_YAW*(e_yaw**2) + W_VEL*(e_v**2) + W_DU*(du_a**2 + du_w**2)
+
             if i == 0:
-                px[:, ip] = xp[:, 0].reshape(-1,)
-            if i == 1:
-                pu[:, ip] = ud[:, 0]
+                px[:, ip] = xp[:, 0]
+                pu[:, ip] = u[:, 0]
 
-        ty = target_trajectory(xp[0, 0])
-        s = refrence_trajectory(state, xp[0, 0], ty)
-        dist = abs(s - xp[1, 0])
-        w = gauss_likelihood(np.array([[dist]]), Q)
-        pw[0, ip] = w
+            u_last = u
 
-    pw = pw / pw.sum()  # normalize
+        costs[ip] = J
 
+    # コスト -> 重み
+    Jmin = costs.min()
+    # 数値安定化のため基準引き（softmax的に）
+    w = np.exp(-0.5 * (costs - Jmin))
+    w_sum = w.sum()
+    if w_sum <= 1e-12 or not np.isfinite(w_sum):
+        pw[:] = 1.0 / NP
+    else:
+        pw[0, :] = w / w_sum
+
+    # 推定（加重平均）
     xEst = px.dot(pw.T)
-    state.x = xEst[0]
-    state.y = xEst[1]
-    state.yaw = xEst[2]
-    state.v = xEst[3]
+    state.x = float(xEst[0,0]); state.y = float(xEst[1,0])
+    state.yaw = float(xEst[2,0]); state.v = float(xEst[3,0])
 
-    px, pw = resampling(px, pw)
+    # リサンプリング
+    px, pw = low_variance_resampling(px, pw)
 
-    i_wmax = np.argmax(pw)
+    # 最良入力（最重粒子の最初の入力）
+    i_best = int(np.argmax(pw))
+    u_next = pu[:, i_best].reshape(2,1)
+    return state, px, pw, u_next
 
-    u = pu[:, i_wmax]
+# ===== Main =====
+def main(show_animation=True):
+    cx, cy = build_path(50.0, 0.1)
+    last_idx = len(cx) - 1
 
-    return state, ind, px, pw, u
+    state = State(x=0.0, y=-3.0, yaw=0.0, v=0.0)
 
-def calc_distance(state, point_x, point_y):
+    px = np.zeros((4, NP))
+    px[0,:]=state.x; px[1,:]=state.y; px[2,:]=state.yaw; px[3,:]=state.v
+    pw = np.zeros((1, NP)) + 1.0/NP
 
-    dx = state.x - point_x
-    dy = state.y - point_y
-    return math.sqrt(dx ** 2 + dy ** 2)
+    u = np.array([[0.5, 0.0]]).T  # 軽く前へ
+    t=0.0
+    xs,ys,vs,ts=[state.x],[state.y],[state.v],[0.0]
+    target_ind = calc_target_index(state, cx, cy, None)
 
-def calc_target_index(state, cx, cy):
+    while t<=TMAX and (last_idx - H) > target_ind:
+        state, px, pw, u = pf_mpc_step(state, cx, cy, px, pw, u)
 
-    global old_nearest_point_index
+        # 可視化・ログ
+        t += DT
+        xs.append(state.x); ys.append(state.y); vs.append(state.v); ts.append(t)
+        target_ind = calc_target_index(state, cx, cy, target_ind)
 
-    if old_nearest_point_index is None:
-        # search nearest point index
-        dx = [state.x - icx for icx in cx]
-        dy = [state.y - icy for icy in cy]
-        d = [abs(math.sqrt(idx ** 2 + idy ** 2)) for (idx, idy) in zip(dx, dy)]
-        ind = d.index(min(d))
-        old_nearest_point_index = ind
-    else:
-        ind = old_nearest_point_index
-        distance_this_index = calc_distance(state, cx[ind], cy[ind])
-        while True:
-            ind = ind + 1 if (ind + 1) < len(cx) else ind
-            distance_next_index = calc_distance(state, cx[ind], cy[ind])
-            if distance_this_index < distance_next_index:
-                break
-            distance_this_index = distance_next_index
-        old_nearest_point_index = ind
-
-    L = 0.0
-
-    Lf = k * state.v + Lfc
-
-    # search look ahead target point index
-    while Lf > L and (ind + 1) < len(cx):
-        dx = cx[ind] - state.x
-        dy = cy[ind] - state.y
-        L = math.sqrt(dx ** 2 + dy ** 2)
-        ind += 1
-
-    return ind
-
-def plot_arrow(x, y, yaw, length=1.0, width=0.5, fc="r", ec="k"):
-    """
-    Plot arrow
-    """
-
-    if not isinstance(x, float):
-        for (ix, iy, iyaw) in zip(x, y, yaw):
-            plot_arrow(ix, iy, iyaw)
-    else:
-        plt.arrow(x, y, length * math.cos(yaw), length * math.sin(yaw),
-                  fc=fc, ec=ec, head_width=width, head_length=width)
-        plt.plot(x, y)
-
-def main():
-    #  target course
-    cx = np.arange(0, 50, 0.1)
-    cy = [target_trajectory(ix) for ix in cx]
-
-    T = 100.0  # max simulation time
-
-    # initial state
-    state = State(x=-0.0, y=-3.0, yaw=0.0, v=0.0)
-    px = np.zeros((4, NP))  # Particle store
-    px[1, :] = state.y
-    pw = np.zeros((1, NP)) + 1.0 / NP  # Particle weight
-
-    lastIndex = len(cx) - 1
-    time = 0.0
-    x = [state.x]
-    y = [state.y]
-    yaw = [state.yaw]
-    v = [state.v]
-    t = [0.0]
-    target_ind = calc_target_index(state, cx, cy)
-
-    u = np.array([[0.0, 0.0]]).T
-
-    while T >= time and lastIndex - H > target_ind:
-
-        state, target_ind, px, pw, u = pf_mpc(state, cx, cy, target_ind, px, pw, u)
-
-        time = time + dt
-
-        x.append(*state.x)
-        y.append(*state.y)
-        yaw.append(*state.yaw)
-        v.append(*state.v)
-        t.append(time)
-
-        if show_animation:  # pragma: no cover
+        if show_animation:
             plt.cla()
-            plot_arrow(state.x, state.y, state.yaw)
             plt.plot(cx, cy, "-r", label="course")
-            plt.plot(x, y, "-b", label="trajectory")
-            plt.plot(px[0, :], px[1, :], ".y")
-            plt.axis("equal")
-            plt.grid(True)
-            plt.title("Speed[km/h]:" + str(state.v * 3.6)[:4])
-            plt.pause(0.001)
+            plt.plot(xs, ys, "-b", label="trajectory")
+            plt.scatter(px[0,:], px[1,:], s=6, c="y")
+            plt.axis("equal"); plt.grid(True); plt.legend()
+            plt.title(f"v={state.v*3.6:.1f} km/h"); plt.pause(0.001)
 
-    # Test
-    assert lastIndex >= target_ind, "Cannot goal"
-
-    if show_animation:  # pragma: no cover
-        plt.cla()
+    if show_animation:
+        plt.figure()
         plt.plot(cx, cy, ".r", label="course")
-        plt.plot(x, y, "-b", label="trajectory")
-        plt.legend()
-        plt.xlabel("x[m]")
-        plt.ylabel("y[m]")
-        plt.axis("equal")
-        plt.grid(True)
+        plt.plot(xs, ys, "-b", label="trajectory")
+        plt.axis("equal"); plt.grid(True); plt.legend()
+        plt.xlabel("x [m]"); plt.ylabel("y [m]")
 
-        plt.subplots(1)
-        plt.plot(t, [iv * 3.6 for iv in v], "-r")
-        plt.xlabel("Time[s]")
-        plt.ylabel("Speed[km/h]")
-        plt.grid(True)
+        plt.figure()
+        plt.plot(ts, [v*3.6 for v in vs], "-")
+        plt.xlabel("Time [s]"); plt.ylabel("Speed [km/h]")
+        plt.grid(True); plt.title("Speed")
         plt.show()
 
-if __name__ == '__main__':
-    print("Particle filtering model predictive control simulation start")
-    main()
+if __name__ == "__main__":
+    main(show_animation=True)
